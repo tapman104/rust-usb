@@ -2,3 +2,15 @@
 Cargo.lock
 **/*.rs.bk
 .env
+
+# Build artifacts
+target/
+**/*.d
+**/*.timestamp
+CACHEDIR.TAG
+.rustc_info.json
+.cargo-lock
+
+# Planning docs (not part of the library)
+Rust_USB_Agent_Reference.md
+Windows_USB_API_Docs.md
