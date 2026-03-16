@@ -1,17 +1,23 @@
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
+use std::sync::Mutex;
 use std::time::Duration;
 
-use core_foundation::base::{kCFAllocatorDefault, CFType, TCFType};
-use core_foundation::dictionary::CFMutableDictionary;
+use core_foundation::base::{kCFAllocatorDefault, TCFType};
 use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
-use core_foundation_sys::base::{CFRelease, CFTypeRef};
+use core_foundation_sys::base::CFTypeRef;
+use core_foundation_sys::uuid::{CFUUIDBytes, CFUUIDGetUUIDBytes, CFUUIDRef};
+use IOKit_sys as iokit_sys;
 use iokit_sys::io_iterator_t;
 use iokit_sys::io_service_t;
 use iokit_sys::kIOMasterPortDefault;
-use iokit_sys::ret_codes::kIOReturnSuccess;
+use iokit_sys::kIOReturnSuccess;
 
-use crate::core::{ConfigDescriptor, ControlSetup, DeviceDescriptor, DeviceInfo};
+use crate::core::{
+    ConfigDescriptor, ControlSetup, DeviceDescriptor, DeviceInfo, EndpointInfo, PipePolicy,
+    PipePolicyKind,
+};
 use crate::error::UsbError;
 
 use super::{UsbBackend, UsbDevice};
@@ -30,6 +36,156 @@ const K_IO_USB_DEVICE_CLASS_NAME: &CStr =
 /// Standard USB GET_DESCRIPTOR request type (IN | Standard | Device)
 const REQ_TYPE_IN_STD_DEV: u8 = 0x80;
 const GET_DESCRIPTOR: u8 = 0x06;
+
+// -----------------------------------------------------------------------
+// Manual IOUSBLib declarations missing from IOKit-sys 0.1.x
+// -----------------------------------------------------------------------
+
+type IOReturn = i32;
+type HRESULT = i32;
+type ULONG = u32;
+const K_IORETURN_EXCLUSIVE_ACCESS: IOReturn = 0xe00002d5u32 as i32;
+const K_IORETURN_NOT_OPEN: IOReturn = 0xe00002d6u32 as i32;
+const K_IORETURN_UNSUPPORTED: IOReturn = 0xe00002c5u32 as i32;
+const K_IORETURN_NO_DEVICE: IOReturn = 0xe00002edu32 as i32;
+
+const K_IOUSB_FIND_INTERFACE_DONT_CARE: u16 = 0xFFFF;
+
+#[repr(C)]
+struct IOUSBFindInterfaceRequest {
+    bInterfaceClass: u16,
+    bInterfaceSubClass: u16,
+    bInterfaceProtocol: u16,
+    bAlternateSetting: u16,
+}
+
+#[repr(C)]
+struct IOUSBDevRequestTO {
+    bmRequestType: u8,
+    bRequest: u8,
+    wValue: u16,
+    wIndex: u16,
+    wLength: u16,
+    pData: *mut std::ffi::c_void,
+    wLenDone: u16,
+    noDataTimeout: u32,
+    completionTimeout: u32,
+}
+
+#[repr(C)]
+struct IOCFPlugInInterface {
+    QueryInterface: Option<
+        unsafe extern "C" fn(
+            this: *mut std::ffi::c_void,
+            iid: CFUUIDBytes,
+            ppv: *mut *mut std::ffi::c_void,
+        ) -> HRESULT,
+    >,
+    AddRef: Option<unsafe extern "C" fn(this: *mut std::ffi::c_void) -> ULONG>,
+    Release: Option<unsafe extern "C" fn(this: *mut std::ffi::c_void) -> ULONG>,
+}
+
+#[repr(C)]
+struct IOUSBDeviceInterface {
+    QueryInterface: Option<
+        unsafe extern "C" fn(
+            this: *mut std::ffi::c_void,
+            iid: CFUUIDBytes,
+            ppv: *mut *mut std::ffi::c_void,
+        ) -> HRESULT,
+    >,
+    AddRef: Option<unsafe extern "C" fn(this: *mut std::ffi::c_void) -> ULONG>,
+    Release: Option<unsafe extern "C" fn(this: *mut std::ffi::c_void) -> ULONG>,
+    USBDeviceOpen: Option<unsafe extern "C" fn(this: *mut std::ffi::c_void) -> IOReturn>,
+    USBDeviceClose: Option<unsafe extern "C" fn(this: *mut std::ffi::c_void) -> IOReturn>,
+    CreateInterfaceIterator: Option<
+        unsafe extern "C" fn(
+            this: *mut std::ffi::c_void,
+            req: *mut IOUSBFindInterfaceRequest,
+            iter: *mut io_iterator_t,
+        ) -> IOReturn,
+    >,
+    DeviceRequestTO: Option<
+        unsafe extern "C" fn(
+            this: *mut std::ffi::c_void,
+            req: *mut IOUSBDevRequestTO,
+        ) -> IOReturn,
+    >,
+}
+
+#[repr(C)]
+struct IOUSBInterfaceInterface {
+    QueryInterface: Option<
+        unsafe extern "C" fn(
+            this: *mut std::ffi::c_void,
+            iid: CFUUIDBytes,
+            ppv: *mut *mut std::ffi::c_void,
+        ) -> HRESULT,
+    >,
+    AddRef: Option<unsafe extern "C" fn(this: *mut std::ffi::c_void) -> ULONG>,
+    Release: Option<unsafe extern "C" fn(this: *mut std::ffi::c_void) -> ULONG>,
+    USBInterfaceOpen: Option<unsafe extern "C" fn(this: *mut std::ffi::c_void) -> IOReturn>,
+    USBInterfaceClose: Option<unsafe extern "C" fn(this: *mut std::ffi::c_void) -> IOReturn>,
+    GetNumEndpoints: Option<
+        unsafe extern "C" fn(this: *mut std::ffi::c_void, num: *mut u8) -> IOReturn,
+    >,
+    GetPipeProperties: Option<
+        unsafe extern "C" fn(
+            this: *mut std::ffi::c_void,
+            pipe_ref: u8,
+            direction: *mut u8,
+            number: *mut u8,
+            transfer_type: *mut u8,
+            max_packet_size: *mut u16,
+            interval: *mut u8,
+        ) -> IOReturn,
+    >,
+    ReadPipe: Option<
+        unsafe extern "C" fn(
+            this: *mut std::ffi::c_void,
+            pipe_ref: u8,
+            buf: *mut std::ffi::c_void,
+            size: *mut u32,
+        ) -> IOReturn,
+    >,
+    WritePipe: Option<
+        unsafe extern "C" fn(
+            this: *mut std::ffi::c_void,
+            pipe_ref: u8,
+            buf: *mut std::ffi::c_void,
+            size: u32,
+        ) -> IOReturn,
+    >,
+    GetInterfaceNumber: Option<
+        unsafe extern "C" fn(
+            this: *mut std::ffi::c_void,
+            interface_number: *mut u8,
+        ) -> IOReturn,
+    >,
+    SetAlternateInterface: Option<
+        unsafe extern "C" fn(
+            this: *mut std::ffi::c_void,
+            alt_setting: u8,
+        ) -> IOReturn,
+    >,
+}
+
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    fn IOCreatePlugInInterfaceForService(
+        service: io_service_t,
+        plugin_type: CFUUIDRef,
+        interface_type: CFUUIDRef,
+        plugin: *mut *mut *mut IOCFPlugInInterface,
+        score: *mut i32,
+    ) -> IOReturn;
+
+    fn kIOCFPlugInInterfaceID() -> CFUUIDRef;
+    fn kIOUSBDeviceUserClientTypeID() -> CFUUIDRef;
+    fn kIOUSBDeviceInterfaceID() -> CFUUIDRef;
+    fn kIOUSBInterfaceUserClientTypeID() -> CFUUIDRef;
+    fn kIOUSBInterfaceInterfaceID() -> CFUUIDRef;
+}
 
 // -----------------------------------------------------------------------
 // Public backend entry point
@@ -133,7 +289,9 @@ fn iokit_integer_property(service: io_service_t, key: &str) -> Option<i64> {
         iokit_sys::IORegistryEntryCreateCFProperty(
             service,
             cf_key.as_concrete_TypeRef() as _,
-            kCFAllocatorDefault,
+            // IOKit-sys 0.1.x uses an older CoreFoundation allocator pointer type.
+            // Casting keeps the same "default allocator" value across crate versions.
+            kCFAllocatorDefault as _,
             0,
         )
     };
@@ -154,7 +312,9 @@ fn iokit_string_property(service: io_service_t, key: &str) -> Option<String> {
         iokit_sys::IORegistryEntryCreateCFProperty(
             service,
             cf_key.as_concrete_TypeRef() as _,
-            kCFAllocatorDefault,
+            // IOKit-sys 0.1.x uses an older CoreFoundation allocator pointer type.
+            // Casting keeps the same "default allocator" value across crate versions.
+            kCFAllocatorDefault as _,
             0,
         )
     };
@@ -192,7 +352,11 @@ struct MacOsDevice {
     path: String,
     /// IOUSBDeviceInterface** — opaque pointer managed via IOKit COM-style interfaces.
     /// NULL if not opened.
-    device_intf: UnsafeCell<*mut *mut iokit_sys::IOUSBDeviceInterface>,
+    device_intf: UnsafeCell<*mut *mut IOUSBDeviceInterface>,
+    /// Interfaces currently claimed by the library.
+    claimed_interfaces: HashSet<u8>,
+    /// Endpoint address -> pipe index (1-based) discovered from interface scans.
+    pipe_cache: Mutex<HashMap<u8, u8>>,
 }
 
 // SAFETY: MacOsDevice is used from a single thread at a time; the raw pointer
@@ -220,12 +384,17 @@ impl MacOsDevice {
 
         // Open the device (USBDeviceOpen).
         // SAFETY: intf_ptr is a valid IOUSBDeviceInterface** obtained above.
-        let kr = unsafe { (**intf_ptr).USBDeviceOpen.map(|f| f(intf_ptr as _)).unwrap_or(0xe00002d6) };
-        if kr != kIOReturnSuccess && kr != 0xe00002d5 {
+        let kr = unsafe {
+            (**intf_ptr)
+                .USBDeviceOpen
+                .map(|f| f(intf_ptr as _))
+                .unwrap_or(K_IORETURN_NOT_OPEN)
+        };
+        if kr != kIOReturnSuccess && kr != K_IORETURN_EXCLUSIVE_ACCESS {
             // 0xe00002d5 = kIOReturnExclusiveAccess — another process has it, treat as permission denied
             // 0xe00002d6 = kIOReturnNotOpen — shouldn't happen, but guard
             // On exclusive access we still proceed — read-only ops (GET_DESCRIPTOR) work without open on some versions
-            if kr == 0xe00002d5 {
+            if kr == K_IORETURN_EXCLUSIVE_ACCESS {
                 log::warn!("IOUSBDevice: exclusive access denied for {path}; descriptor reads may fail");
             } else {
                 return Err(UsbError::Io(std::io::Error::from_raw_os_error(kr as i32)));
@@ -235,6 +404,8 @@ impl MacOsDevice {
         Ok(Self {
             path: path.to_owned(),
             device_intf: UnsafeCell::new(intf_ptr),
+            claimed_interfaces: HashSet::new(),
+            pipe_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -254,7 +425,7 @@ impl MacOsDevice {
             return Err(UsbError::InvalidHandle);
         }
 
-        let mut req = iokit_sys::IOUSBDevRequestTO {
+        let mut req = IOUSBDevRequestTO {
             bmRequestType: request_type,
             bRequest: request,
             wValue: value,
@@ -271,14 +442,376 @@ impl MacOsDevice {
             (**intf_ptr)
                 .DeviceRequestTO
                 .map(|f| f(intf_ptr as _, &mut req))
-                .unwrap_or(0xe00002c5) // kIOReturnUnsupported
+                .unwrap_or(K_IORETURN_UNSUPPORTED) // kIOReturnUnsupported
         };
 
         if kr != kIOReturnSuccess {
-            return Err(iokit_kr_to_usb_error(kr));
+            return Err(iokit_kr_to_usb_error(kr as u32));
         }
 
         Ok(req.wLenDone as usize)
+    }
+
+    /// GET_INTERFACE via standard control request.
+    fn get_interface_alt_setting(&self, interface: u8, timeout_ms: u32) -> Result<u8, UsbError> {
+        let mut buf = [0u8; 1];
+        // IN | Standard | Interface, bRequest=GET_INTERFACE
+        let n = self.raw_control(0x81, 0x0A, 0, interface as u16, &mut buf, timeout_ms)?;
+        if n < 1 {
+            return Err(UsbError::InvalidDescriptor);
+        }
+        Ok(buf[0])
+    }
+
+    /// SET_INTERFACE via standard control request.
+    fn set_interface_alt_setting(
+        &self,
+        interface: u8,
+        alt_setting: u8,
+        timeout_ms: u32,
+    ) -> Result<(), UsbError> {
+        // OUT | Standard | Interface, bRequest=SET_INTERFACE
+        let mut empty = [];
+        self.raw_control(
+            0x01,
+            0x0B,
+            alt_setting as u16,
+            interface as u16,
+            &mut empty,
+            timeout_ms,
+        )?;
+        Ok(())
+    }
+
+    fn interface_exists(&self, interface: u8) -> Result<bool, UsbError> {
+        let cfg = self.read_config_descriptor(0)?;
+        Ok(cfg
+            .interfaces
+            .iter()
+            .any(|iface| iface.interface_number == interface))
+    }
+
+    fn open_interface_for_endpoint(
+        &self,
+        endpoint: u8,
+    ) -> Result<*mut *mut IOUSBInterfaceInterface, UsbError> {
+        // SAFETY: device_intf is initialized in open(); backend uses this pointer as an opaque handle.
+        let device_intf = unsafe { *self.device_intf.get() };
+        if device_intf.is_null() {
+            return Err(UsbError::InvalidHandle);
+        }
+
+        let mut find_req = IOUSBFindInterfaceRequest {
+            bInterfaceClass: K_IOUSB_FIND_INTERFACE_DONT_CARE,
+            bInterfaceSubClass: K_IOUSB_FIND_INTERFACE_DONT_CARE,
+            bInterfaceProtocol: K_IOUSB_FIND_INTERFACE_DONT_CARE,
+            bAlternateSetting: K_IOUSB_FIND_INTERFACE_DONT_CARE,
+        };
+        let mut iter: io_iterator_t = 0;
+
+        // SAFETY: device_intf is a valid IOUSBDeviceInterface** and pointers are valid out-params.
+        let create_iter_kr = unsafe {
+            (**device_intf)
+                .CreateInterfaceIterator
+                .map(|f| f(device_intf as _, &mut find_req, &mut iter))
+                .unwrap_or(K_IORETURN_UNSUPPORTED)
+        };
+        if create_iter_kr != kIOReturnSuccess {
+            return Err(iokit_pipe_kr_to_usb_error(create_iter_kr));
+        }
+
+        if iter == 0 {
+            return Err(UsbError::InvalidHandle);
+        }
+
+        loop {
+            // SAFETY: iter is valid while held in this function.
+            let service = unsafe { iokit_sys::IOIteratorNext(iter) };
+            if service == 0 {
+                break;
+            }
+
+            let mut plugin: *mut *mut IOCFPlugInInterface = std::ptr::null_mut();
+            let mut score: i32 = 0;
+
+            // SAFETY: service is valid and out-pointers are valid.
+            let create_plugin_kr = unsafe {
+                IOCreatePlugInInterfaceForService(
+                    service,
+                    kIOUSBInterfaceUserClientTypeID(),
+                    kIOCFPlugInInterfaceID(),
+                    &mut plugin,
+                    &mut score,
+                )
+            };
+            // SAFETY: service came from IOIteratorNext and must be released once consumed.
+            unsafe { iokit_sys::IOObjectRelease(service) };
+
+            if create_plugin_kr != kIOReturnSuccess {
+                // SAFETY: iter is valid and owned by this function.
+                unsafe { iokit_sys::IOObjectRelease(iter) };
+                return Err(iokit_pipe_kr_to_usb_error(create_plugin_kr));
+            }
+            if plugin.is_null() {
+                // SAFETY: iter is valid and owned by this function.
+                unsafe { iokit_sys::IOObjectRelease(iter) };
+                return Err(UsbError::InvalidHandle);
+            }
+
+            let mut interface_intf: *mut *mut IOUSBInterfaceInterface = std::ptr::null_mut();
+            // SAFETY: plugin is valid; QueryInterface writes to interface_intf on success.
+            let query_kr = unsafe {
+                (**plugin)
+                    .QueryInterface
+                    .map(|qi| {
+                        qi(
+                            plugin as _,
+                            CFUUIDGetUUIDBytes(kIOUSBInterfaceInterfaceID()),
+                            &mut interface_intf as *mut _ as *mut _,
+                        )
+                    })
+                    .unwrap_or(K_IORETURN_UNSUPPORTED)
+            };
+            // SAFETY: plugin is valid and must always be released after QueryInterface.
+            unsafe { (**plugin).Release.map(|r| r(plugin as _)) };
+
+            if query_kr != 0 || interface_intf.is_null() {
+                // SAFETY: iter is valid and owned by this function.
+                unsafe { iokit_sys::IOObjectRelease(iter) };
+                return Err(UsbError::Other(format!(
+                    "QueryInterface for IOUSBInterfaceInterface failed: {query_kr:#x}"
+                )));
+            }
+
+            // SAFETY: interface_intf is valid and points to an interface vtable.
+            let open_kr = unsafe {
+                (**interface_intf)
+                    .USBInterfaceOpen
+                    .map(|f| f(interface_intf as _))
+                    .unwrap_or(K_IORETURN_UNSUPPORTED)
+            };
+            if open_kr != kIOReturnSuccess {
+                close_and_release_interface(interface_intf);
+                // SAFETY: iter is valid and owned by this function.
+                unsafe { iokit_sys::IOObjectRelease(iter) };
+                return Err(iokit_pipe_kr_to_usb_error(open_kr));
+            }
+
+            let mut num_endpoints: u8 = 0;
+            // SAFETY: interface_intf is open/valid and num_endpoints is a valid out-pointer.
+            let num_ep_kr = unsafe {
+                (**interface_intf)
+                    .GetNumEndpoints
+                    .map(|f| f(interface_intf as _, &mut num_endpoints))
+                    .unwrap_or(K_IORETURN_UNSUPPORTED)
+            };
+            if num_ep_kr != kIOReturnSuccess {
+                close_and_release_interface(interface_intf);
+                // SAFETY: iter is valid and owned by this function.
+                unsafe { iokit_sys::IOObjectRelease(iter) };
+                return Err(iokit_pipe_kr_to_usb_error(num_ep_kr));
+            }
+
+            let mut discovered = HashMap::new();
+            for pipe_ref in 1..=num_endpoints {
+                let mut direction: u8 = 0;
+                let mut number: u8 = 0;
+                let mut transfer_type: u8 = 0;
+                let mut max_packet_size: u16 = 0;
+                let mut interval: u8 = 0;
+
+                // SAFETY: interface_intf is valid and all out-pointers are initialized above.
+                let pipe_kr = unsafe {
+                    (**interface_intf)
+                        .GetPipeProperties
+                        .map(|f| {
+                            f(
+                                interface_intf as _,
+                                pipe_ref,
+                                &mut direction,
+                                &mut number,
+                                &mut transfer_type,
+                                &mut max_packet_size,
+                                &mut interval,
+                            )
+                        })
+                        .unwrap_or(K_IORETURN_UNSUPPORTED)
+                };
+                if pipe_kr != kIOReturnSuccess {
+                    close_and_release_interface(interface_intf);
+                    // SAFETY: iter is valid and owned by this function.
+                    unsafe { iokit_sys::IOObjectRelease(iter) };
+                    return Err(iokit_pipe_kr_to_usb_error(pipe_kr));
+                }
+
+                let endpoint_address = (number & 0x0f) | if direction != 0 { 0x80 } else { 0x00 };
+                discovered.insert(endpoint_address, pipe_ref);
+            }
+
+            let found = discovered.contains_key(&endpoint);
+            let mut cache = match self.pipe_cache.lock() {
+                Ok(cache) => cache,
+                Err(_) => {
+                    close_and_release_interface(interface_intf);
+                    // SAFETY: iter is valid and owned by this function.
+                    unsafe { iokit_sys::IOObjectRelease(iter) };
+                    return Err(UsbError::Other("macOS pipe cache lock poisoned".into()));
+                }
+            };
+            cache.extend(discovered.into_iter());
+            drop(cache);
+
+            if found {
+                // SAFETY: iter is valid and owned by this function.
+                unsafe { iokit_sys::IOObjectRelease(iter) };
+                return Ok(interface_intf);
+            }
+
+            close_and_release_interface(interface_intf);
+        }
+
+        // SAFETY: iter is valid and owned by this function.
+        unsafe { iokit_sys::IOObjectRelease(iter) };
+        Err(UsbError::Other(format!(
+            "endpoint {endpoint:#04x} not found on any interface"
+        )))
+    }
+
+    /// Find and open the IOUSBInterfaceInterface matching `interface_number`.
+    /// The returned pointer is already opened; the caller is responsible for
+    /// calling `close_and_release_interface` on every exit path.
+    fn find_interface(
+        &self,
+        interface_number: u8,
+    ) -> Result<*mut *mut IOUSBInterfaceInterface, UsbError> {
+        // SAFETY: device_intf is initialised in open(); single-threaded access.
+        let device_intf = unsafe { *self.device_intf.get() };
+        if device_intf.is_null() {
+            return Err(UsbError::InvalidHandle);
+        }
+
+        let mut find_req = IOUSBFindInterfaceRequest {
+            bInterfaceClass: K_IOUSB_FIND_INTERFACE_DONT_CARE,
+            bInterfaceSubClass: K_IOUSB_FIND_INTERFACE_DONT_CARE,
+            bInterfaceProtocol: K_IOUSB_FIND_INTERFACE_DONT_CARE,
+            bAlternateSetting: K_IOUSB_FIND_INTERFACE_DONT_CARE,
+        };
+        let mut iter: io_iterator_t = 0;
+
+        // SAFETY: device_intf is a valid IOUSBDeviceInterface**; both out-params are valid.
+        let create_iter_kr = unsafe {
+            (**device_intf)
+                .CreateInterfaceIterator
+                .map(|f| f(device_intf as _, &mut find_req, &mut iter))
+                .unwrap_or(K_IORETURN_UNSUPPORTED)
+        };
+        if create_iter_kr != kIOReturnSuccess {
+            return Err(iokit_pipe_kr_to_usb_error(create_iter_kr));
+        }
+        if iter == 0 {
+            return Err(UsbError::InvalidHandle);
+        }
+
+        loop {
+            // SAFETY: iter is a valid io_iterator_t owned by this function.
+            let service = unsafe { iokit_sys::IOIteratorNext(iter) };
+            if service == 0 {
+                break;
+            }
+
+            let mut plugin: *mut *mut IOCFPlugInInterface = std::ptr::null_mut();
+            let mut score: i32 = 0;
+
+            // SAFETY: service is valid and out-pointers are valid.
+            let create_plugin_kr = unsafe {
+                IOCreatePlugInInterfaceForService(
+                    service,
+                    kIOUSBInterfaceUserClientTypeID(),
+                    kIOCFPlugInInterfaceID(),
+                    &mut plugin,
+                    &mut score,
+                )
+            };
+            // SAFETY: service came from IOIteratorNext and must be released once consumed.
+            unsafe { iokit_sys::IOObjectRelease(service) };
+
+            if create_plugin_kr != kIOReturnSuccess || plugin.is_null() {
+                // SAFETY: iter is owned by this function; release before returning.
+                unsafe { iokit_sys::IOObjectRelease(iter) };
+                return Err(iokit_pipe_kr_to_usb_error(create_plugin_kr));
+            }
+
+            let mut interface_intf: *mut *mut IOUSBInterfaceInterface = std::ptr::null_mut();
+            // SAFETY: plugin is valid; QueryInterface writes to interface_intf on success.
+            let query_kr = unsafe {
+                (**plugin)
+                    .QueryInterface
+                    .map(|qi| {
+                        qi(
+                            plugin as _,
+                            CFUUIDGetUUIDBytes(kIOUSBInterfaceInterfaceID()),
+                            &mut interface_intf as *mut _ as *mut _,
+                        )
+                    })
+                    .unwrap_or(K_IORETURN_UNSUPPORTED)
+            };
+            // SAFETY: plugin must always be released after QueryInterface.
+            unsafe { (**plugin).Release.map(|r| r(plugin as _)) };
+
+            if query_kr != 0 || interface_intf.is_null() {
+                // SAFETY: iter is owned by this function; release before returning.
+                unsafe { iokit_sys::IOObjectRelease(iter) };
+                return Err(UsbError::Other(format!(
+                    "QueryInterface for IOUSBInterfaceInterface failed: {query_kr:#x}"
+                )));
+            }
+
+            // SAFETY: interface_intf is valid and points to an interface vtable.
+            let open_kr = unsafe {
+                (**interface_intf)
+                    .USBInterfaceOpen
+                    .map(|f| f(interface_intf as _))
+                    .unwrap_or(K_IORETURN_UNSUPPORTED)
+            };
+            if open_kr != kIOReturnSuccess {
+                close_and_release_interface(interface_intf);
+                // SAFETY: iter is owned by this function; release before returning.
+                unsafe { iokit_sys::IOObjectRelease(iter) };
+                return Err(iokit_pipe_kr_to_usb_error(open_kr));
+            }
+
+            let mut found_number: u8 = 0;
+            // SAFETY: interface_intf is open/valid; found_number is a valid out-pointer.
+            let num_kr = unsafe {
+                (**interface_intf)
+                    .GetInterfaceNumber
+                    .map(|f| f(interface_intf as _, &mut found_number))
+                    .unwrap_or(K_IORETURN_UNSUPPORTED)
+            };
+            if num_kr != kIOReturnSuccess {
+                close_and_release_interface(interface_intf);
+                // SAFETY: iter is owned by this function; release before returning.
+                unsafe { iokit_sys::IOObjectRelease(iter) };
+                return Err(iokit_pipe_kr_to_usb_error(num_kr));
+            }
+
+            if found_number == interface_number {
+                // Match found — release iterator and return the open interface pointer.
+                // SAFETY: iter is owned by this function; release before returning.
+                unsafe { iokit_sys::IOObjectRelease(iter) };
+                return Ok(interface_intf);
+            }
+
+            // Not a match — close and release this interface, continue searching.
+            close_and_release_interface(interface_intf);
+        }
+
+        // Iterator exhausted; no interface with the requested number exists.
+        // SAFETY: iter is owned by this function; release on exit.
+        unsafe { iokit_sys::IOObjectRelease(iter) };
+        Err(UsbError::Other(format!(
+            "interface {interface_number} not found"
+        )))
     }
 }
 
@@ -351,15 +884,32 @@ impl UsbDevice for MacOsDevice {
     }
 
     fn claim_interface(&mut self, interface: u8) -> Result<(), UsbError> {
-        // IOUSBLib does not have a separate claim step at the device level;
-        // interfaces are accessed by creating an IOUSBInterface service plugin.
-        // For Phase 1 (control transfers on EP0), this is a no-op.
-        log::debug!("macOS: claim_interface({interface}) — no-op at device level");
+        if self.claimed_interfaces.contains(&interface) {
+            return Ok(());
+        }
+
+        if !self.interface_exists(interface)? {
+            return Err(UsbError::Other(format!(
+                "interface {interface} not found in configuration"
+            )));
+        }
+
+        // Validate the interface is reachable by querying current alt-setting.
+        let alt = self.get_interface_alt_setting(interface, 1000)?;
+        log::debug!("macOS: claimed interface {interface} (alt={alt})");
+        self.claimed_interfaces.insert(interface);
         Ok(())
     }
 
     fn release_interface(&mut self, interface: u8) -> Result<(), UsbError> {
-        log::debug!("macOS: release_interface({interface}) — no-op at device level");
+        if !self.claimed_interfaces.contains(&interface) {
+            return Ok(());
+        }
+
+        // Best-effort return to alt 0 on release.
+        self.set_interface_alt_setting(interface, 0, 1000)?;
+        self.claimed_interfaces.remove(&interface);
+        log::debug!("macOS: released interface {interface}");
         Ok(())
     }
 
@@ -408,27 +958,294 @@ impl UsbDevice for MacOsDevice {
             }
         }
     }
+
+    fn bulk_read(
+        &self,
+        endpoint: u8,
+        buf: &mut [u8],
+        _timeout: Duration,
+    ) -> Result<usize, UsbError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let mut transfer_size = u32::try_from(buf.len())
+            .map_err(|_| UsbError::Other("buffer length exceeds macOS pipe size".into()))?;
+
+        let interface_intf = self.open_interface_for_endpoint(endpoint)?;
+        let pipe_ref = match self.pipe_cache.lock() {
+            Ok(cache) => match cache.get(&endpoint).copied() {
+                Some(pipe_ref) => pipe_ref,
+                None => {
+                    close_and_release_interface(interface_intf);
+                    return Err(UsbError::Other(format!(
+                        "endpoint {endpoint:#04x} has no mapped pipe"
+                    )));
+                }
+            },
+            Err(_) => {
+                close_and_release_interface(interface_intf);
+                return Err(UsbError::Other("macOS pipe cache lock poisoned".into()));
+            }
+        };
+
+        // SAFETY: interface_intf is open/valid; buf points to writable memory for transfer_size bytes.
+        let kr = unsafe {
+            (**interface_intf)
+                .ReadPipe
+                .map(|f| {
+                    f(
+                        interface_intf as _,
+                        pipe_ref,
+                        buf.as_mut_ptr() as *mut std::ffi::c_void,
+                        &mut transfer_size,
+                    )
+                })
+                .unwrap_or(K_IORETURN_UNSUPPORTED)
+        };
+
+        let result = if kr == kIOReturnSuccess {
+            Ok(transfer_size as usize)
+        } else {
+            Err(iokit_pipe_kr_to_usb_error(kr))
+        };
+
+        close_and_release_interface(interface_intf);
+        result
+    }
+
+    fn bulk_write(
+        &self,
+        endpoint: u8,
+        buf: &[u8],
+        _timeout: Duration,
+    ) -> Result<usize, UsbError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let transfer_size = u32::try_from(buf.len())
+            .map_err(|_| UsbError::Other("buffer length exceeds macOS pipe size".into()))?;
+
+        let interface_intf = self.open_interface_for_endpoint(endpoint)?;
+        let pipe_ref = match self.pipe_cache.lock() {
+            Ok(cache) => match cache.get(&endpoint).copied() {
+                Some(pipe_ref) => pipe_ref,
+                None => {
+                    close_and_release_interface(interface_intf);
+                    return Err(UsbError::Other(format!(
+                        "endpoint {endpoint:#04x} has no mapped pipe"
+                    )));
+                }
+            },
+            Err(_) => {
+                close_and_release_interface(interface_intf);
+                return Err(UsbError::Other("macOS pipe cache lock poisoned".into()));
+            }
+        };
+
+        // SAFETY: interface_intf is open/valid; buf points to readable memory for transfer_size bytes.
+        let kr = unsafe {
+            (**interface_intf)
+                .WritePipe
+                .map(|f| {
+                    f(
+                        interface_intf as _,
+                        pipe_ref,
+                        buf.as_ptr() as *mut std::ffi::c_void,
+                        transfer_size,
+                    )
+                })
+                .unwrap_or(K_IORETURN_UNSUPPORTED)
+        };
+
+        let result = if kr == kIOReturnSuccess {
+            Ok(transfer_size as usize)
+        } else {
+            Err(iokit_pipe_kr_to_usb_error(kr))
+        };
+
+        close_and_release_interface(interface_intf);
+        result
+    }
+
+    fn interrupt_read(
+        &self,
+        endpoint: u8,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> Result<usize, UsbError> {
+        self.bulk_read(endpoint, buf, timeout)
+    }
+
+    fn interrupt_write(
+        &self,
+        endpoint: u8,
+        buf: &[u8],
+        timeout: Duration,
+    ) -> Result<usize, UsbError> {
+        self.bulk_write(endpoint, buf, timeout)
+    }
+
+    fn get_alternate_setting(&self, interface: u8) -> Result<u8, UsbError> {
+        // SAFETY: delegates to raw_control which uses the already-opened device interface.
+        // A standard GET_INTERFACE control request (IN | Standard | Interface, bRequest=0x0A)
+        // returns the current alternate setting directly from the device without requiring
+        // an IOKit interface object — the device interface vtable handles it via DeviceRequestTO.
+        self.get_interface_alt_setting(interface, 5000)
+    }
+
+    fn set_alternate_setting(&mut self, interface: u8, alt: u8) -> Result<(), UsbError> {
+        // Locate the IOUSBInterfaceInterface for this interface number.
+        let intf = self.find_interface(interface)?;
+
+        // SAFETY: intf is a valid, open IOUSBInterfaceInterface** returned by find_interface.
+        // SetAlternateInterface reprograms the interface to the given alternate setting on the
+        // host controller side; we close and release the interface after the call regardless.
+        let kr = unsafe {
+            (**intf)
+                .SetAlternateInterface
+                .map(|f| f(intf as _, alt))
+                .unwrap_or(K_IORETURN_UNSUPPORTED)
+        };
+        close_and_release_interface(intf);
+
+        if kr != kIOReturnSuccess {
+            return Err(iokit_pipe_kr_to_usb_error(kr));
+        }
+
+        // An alternate setting change can reassign pipe indices, so the cached
+        // endpoint-to-pipe-ref mapping is no longer valid.
+        self.pipe_cache.lock().unwrap().clear();
+        Ok(())
+    }
+
+    fn get_pipe_info(&self, endpoint: u8) -> Result<EndpointInfo, UsbError> {
+        let interface_intf = self.open_interface_for_endpoint(endpoint)?;
+
+        let pipe_ref = match self.pipe_cache.lock() {
+            Ok(cache) => match cache.get(&endpoint).copied() {
+                Some(r) => r,
+                None => {
+                    close_and_release_interface(interface_intf);
+                    return Err(UsbError::Other(format!(
+                        "endpoint {endpoint:#04x} not in pipe cache after interface scan"
+                    )));
+                }
+            },
+            Err(_) => {
+                close_and_release_interface(interface_intf);
+                return Err(UsbError::Other("macOS pipe cache lock poisoned".into()));
+            }
+        };
+
+        let mut direction: u8 = 0;
+        let mut number: u8 = 0;
+        let mut transfer_type: u8 = 0;
+        let mut max_packet_size: u16 = 0;
+        let mut interval: u8 = 0;
+
+        // SAFETY: interface_intf is an open, valid IOUSBInterfaceInterface** returned by
+        // open_interface_for_endpoint; all out-pointers are valid stack locations.
+        let kr = unsafe {
+            (**interface_intf)
+                .GetPipeProperties
+                .map(|f| {
+                    f(
+                        interface_intf as _,
+                        pipe_ref,
+                        &mut direction,
+                        &mut number,
+                        &mut transfer_type,
+                        &mut max_packet_size,
+                        &mut interval,
+                    )
+                })
+                .unwrap_or(K_IORETURN_UNSUPPORTED)
+        };
+
+        close_and_release_interface(interface_intf);
+
+        if kr != kIOReturnSuccess {
+            return Err(iokit_pipe_kr_to_usb_error(kr));
+        }
+
+        // Reconstruct the endpoint address byte (direction bit | endpoint number) and
+        // the attributes byte (transfer_type in bits 1:0) so we can reuse EndpointInfo::new.
+        // IOKit direction: 0 = Out, 1 = In.  IOKit transfer_type: 0=Control 1=Iso 2=Bulk 3=Interrupt
+        // — these values are identical to the USB spec bmAttributes bits 1:0.
+        let address = (number & 0x0f) | if direction != 0 { 0x80 } else { 0x00 };
+        Ok(EndpointInfo::new(address, transfer_type, max_packet_size, interval))
+    }
+
+    fn get_pipe_policy(
+        &self,
+        _endpoint: u8,
+        _kind: PipePolicyKind,
+    ) -> Result<PipePolicy, UsbError> {
+        // macOS: IOKit does not expose pipe policy in user space.
+        Err(UsbError::Unsupported)
+    }
+
+    fn set_pipe_policy(&self, _endpoint: u8, _policy: PipePolicy) -> Result<(), UsbError> {
+        // macOS: IOKit does not expose pipe policy in user space.
+        Err(UsbError::Unsupported)
+    }
 }
 
 // -----------------------------------------------------------------------
 // IOKit helpers
 // -----------------------------------------------------------------------
 
+fn close_and_release_interface(interface_intf: *mut *mut IOUSBInterfaceInterface) {
+    if interface_intf.is_null() {
+        return;
+    }
+
+    // SAFETY: interface_intf is an interface pointer returned by QueryInterface; calls are COM-style cleanup.
+    unsafe {
+        let _ = (**interface_intf)
+            .USBInterfaceClose
+            .map(|f| f(interface_intf as _));
+        let _ = (**interface_intf).Release.map(|f| f(interface_intf as _));
+    }
+}
+
+fn iokit_pipe_kr_to_usb_error(kr: IOReturn) -> UsbError {
+    if kr == kIOReturnSuccess {
+        return UsbError::Other("unexpected success code in error mapper".into());
+    }
+
+    match kr {
+        K_IORETURN_NO_DEVICE | K_IORETURN_NOT_OPEN => UsbError::InvalidHandle,
+        K_IORETURN_UNSUPPORTED => UsbError::Unsupported,
+        other => UsbError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("IOReturn {:#010x}", other as u32),
+        )),
+    }
+}
+
 /// Parse the "iokit:bus=B,addr=A,..." path back into (bus, addr).
 fn parse_iokit_path(path: &str) -> Result<(u8, u8), UsbError> {
-    let bus = path
-        .split(',')
-        .find(|s| s.starts_with("bus="))
-        .and_then(|s| s.strip_prefix("bus="))
-        .and_then(|s| s.parse::<u8>().ok())
-        .ok_or_else(|| UsbError::Other(format!("invalid iokit path: {path}")))?;
+    let normalized = path.strip_prefix("iokit:").unwrap_or(path);
+    let mut bus: Option<u8> = None;
+    let mut addr: Option<u8> = None;
 
-    let addr = path
-        .split(',')
-        .find(|s| s.starts_with("addr="))
-        .and_then(|s| s.strip_prefix("addr="))
-        .and_then(|s| s.parse::<u8>().ok())
-        .ok_or_else(|| UsbError::Other(format!("invalid iokit path: {path}")))?;
+    for part in normalized.split(',') {
+        let mut it = part.splitn(2, '=');
+        let key = it.next().unwrap_or("").trim();
+        let val = it.next().unwrap_or("").trim();
+        match key {
+            "bus" => bus = val.parse::<u8>().ok(),
+            "addr" => addr = val.parse::<u8>().ok(),
+            _ => {}
+        }
+    }
+
+    let bus = bus.ok_or_else(|| UsbError::Other(format!("invalid iokit path (missing bus): {path}")))?;
+    let addr =
+        addr.ok_or_else(|| UsbError::Other(format!("invalid iokit path (missing addr): {path}")))?;
 
     Ok((bus, addr))
 }
@@ -474,12 +1291,7 @@ fn find_service_by_bus_addr(bus: u8, addr: u8) -> Option<io_service_t> {
 /// Create an IOUSBDeviceInterface** for a given io_service_t.
 fn create_device_interface(
     service: io_service_t,
-) -> Result<*mut *mut iokit_sys::IOUSBDeviceInterface, UsbError> {
-    use iokit_sys::{
-        kIOCFPlugInInterfaceID, kIOUSBDeviceUserClientTypeID, IOCreatePlugInInterfaceForService,
-        IOCFPlugInInterface,
-    };
-
+) -> Result<*mut *mut IOUSBDeviceInterface, UsbError> {
     let mut plugin: *mut *mut IOCFPlugInInterface = std::ptr::null_mut();
     let mut score: i32 = 0;
 
@@ -502,15 +1314,15 @@ fn create_device_interface(
 
     // QueryInterface for IOUSBDeviceInterface.
     // SAFETY: plugin is a valid IOCFPlugInInterface**.
-    let mut device_intf: *mut *mut iokit_sys::IOUSBDeviceInterface = std::ptr::null_mut();
+    let mut device_intf: *mut *mut IOUSBDeviceInterface = std::ptr::null_mut();
     let kr = unsafe {
         (**plugin).QueryInterface.map(|qi| {
             qi(
                 plugin as _,
-                iokit_sys::CFUUIDGetUUIDBytes(iokit_sys::kIOUSBDeviceInterfaceID()),
+                CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID()),
                 &mut device_intf as *mut _ as *mut _,
             )
-        }).unwrap_or(0xe00002c5 as i32)
+        }).unwrap_or(K_IORETURN_UNSUPPORTED)
     };
 
     // Release the plugin interface regardless of QueryInterface result.

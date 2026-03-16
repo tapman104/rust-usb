@@ -10,7 +10,7 @@
 //! This module is compiled only when the `tokio` feature is enabled:
 //!
 //! ```toml
-//! usb-lib = { version = "0.1", features = ["tokio"] }
+//! rust-usb = { version = "0.1", features = ["tokio"] }
 //! ```
 //!
 //! # Thread safety

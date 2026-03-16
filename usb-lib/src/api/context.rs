@@ -30,7 +30,7 @@ impl UsbContext {
         Ok(DeviceHandle::new(dev))
     }
 
-    /// Register a callback that is invoked whenever a WinUSB device arrives or
+    /// Register a callback that is invoked whenever a USB device arrives or
     /// departs.  Returns a [`HotplugHandle`] that keeps the subscription alive.
     ///
     /// The callback is invoked from a **system thread** — keep it short and

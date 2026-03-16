@@ -1,4 +1,4 @@
-# usblibr
+# rust-usb
 
 A cross-platform Rust library for USB device communication on **Windows**, **Linux**, and **macOS**.
 
@@ -31,20 +31,20 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-usblibr = "0.1"
+rust-usb = "0.1"
 ```
 
 Optional features:
 
 ```toml
 [dependencies]
-usblibr = { version = "0.1", features = ["isochronous", "tokio"] }
+rust-usb = { version = "0.1", features = ["isochronous", "tokio"] }
 ```
 
 ## Quick Start
 
 ```rust
-use usblibr::UsbContext;
+use rust_usb::UsbContext;
 
 fn main() -> anyhow::Result<()> {
     let ctx = UsbContext::new()?;
@@ -65,7 +65,7 @@ fn main() -> anyhow::Result<()> {
 Open a device and perform a control transfer:
 
 ```rust
-use usblibr::{UsbContext, ControlSetup, Direction, RequestType, Recipient};
+use rust_usb::{UsbContext, ControlSetup, Direction, RequestType, Recipient};
 
 let ctx = UsbContext::new()?;
 let devices = ctx.list_devices()?;

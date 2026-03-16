@@ -1,4 +1,4 @@
-use usb_lib::UsbContext;
+use rust_usb::UsbContext;
 
 fn main() {
     let ctx = UsbContext::new();

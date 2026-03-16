@@ -1,10 +1,10 @@
-//! # usb-lib
+//! # rust-usb
 //!
 //! A cross-platform Rust USB library with a complete Windows backend.
 //!
 //! ## Quick start
 //! ```no_run
-//! use usb_lib::UsbContext;
+//! use rust_usb::UsbContext;
 //!
 //! let ctx = UsbContext::new();
 //! for device in ctx.devices().unwrap() {
@@ -22,7 +22,7 @@ pub mod hotplug;
 ///
 /// Import this module when the `tokio` feature is enabled:
 /// ```toml
-/// usb-lib = { version = "0.1", features = ["tokio"] }
+/// rust-usb = { version = "0.1", features = ["tokio"] }
 /// ```
 #[cfg(feature = "tokio")]
 pub mod async_transfers {

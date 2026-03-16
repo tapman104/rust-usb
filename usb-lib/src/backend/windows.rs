@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use windows::core::PCWSTR;
+use windows::core::{PCSTR, PCWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
     SetupDiGetDeviceInterfaceDetailW, SetupDiGetDeviceRegistryPropertyW, DIGCF_DEVICEINTERFACE,
@@ -15,13 +15,14 @@ use windows::Win32::Devices::Usb::{
     WINUSB_SETUP_PACKET,
 };
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, GENERIC_READ,
+    GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
-use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
 
 use crate::core::{
@@ -32,10 +33,39 @@ use crate::error::UsbError;
 
 use super::{UsbBackend, UsbDevice};
 
-// Manual FFI: WinUsb_ResetDevice is missing from windows-rs 0.58.
-// winusb.dll is already linked by the windows crate, so no #[link] attribute needed.
-extern "system" {
-    fn WinUsb_ResetDevice(InterfaceHandle: *mut core::ffi::c_void) -> windows::Win32::Foundation::BOOL;
+// Manual binding: WinUsb_ResetDevice is missing from windows-rs 0.58 metadata.
+// Other WinUSB APIs are imported through windows-rs, but this one needs explicit
+// runtime symbol resolution to avoid toolchain-specific import library issues.
+type WinUsbResetDeviceFn =
+    unsafe extern "system" fn(interface_handle: *mut core::ffi::c_void) -> windows::Win32::Foundation::BOOL;
+
+fn resolve_winusb_reset_device() -> Result<WinUsbResetDeviceFn, UsbError> {
+    static RESET_FN: std::sync::OnceLock<Option<WinUsbResetDeviceFn>> = std::sync::OnceLock::new();
+
+    let maybe_fn = RESET_FN.get_or_init(|| {
+        let dll_name: Vec<u16> = "winusb.dll"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // SAFETY: dll_name is a valid null-terminated UTF-16 string for this call.
+        let module = unsafe { LoadLibraryW(PCWSTR(dll_name.as_ptr())) }.ok()?;
+        let sym = b"WinUsb_ResetDevice\0";
+        // SAFETY: module is valid and sym is a null-terminated C string.
+        let proc = unsafe { GetProcAddress(module, PCSTR(sym.as_ptr())) }?;
+        // SAFETY: proc points to WinUsb_ResetDevice with the exact ABI/signature.
+        Some(unsafe {
+            std::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                WinUsbResetDeviceFn,
+            >(proc)
+        })
+    });
+
+    maybe_fn
+        .as_ref()
+        .copied()
+        .ok_or_else(|| UsbError::Other("WinUsb_ResetDevice symbol not found in winusb.dll".into()))
 }
 
 // Manual FFI: Isochronous APIs missing from windows-rs 0.58.
@@ -846,8 +876,9 @@ impl UsbDevice for WinUsbDevice {
 
     fn reset_device(&self) -> Result<(), UsbError> {
         // SAFETY: usb_handle.0 is the opaque WinUSB interface handle pointer.
-        // WinUsb_ResetDevice is declared in our extern "system" block above.
-        let ok = unsafe { WinUsb_ResetDevice(self.usb_handle.0) };
+        // resolve_winusb_reset_device returns a function pointer with matching ABI.
+        let reset = resolve_winusb_reset_device()?;
+        let ok = unsafe { reset(self.usb_handle.0) };
         if ok.as_bool() {
             Ok(())
         } else {
@@ -1087,6 +1118,25 @@ impl UsbDevice for WinUsbDevice {
 
 /// Issue a WinUSB pipe read using an OVERLAPPED structure and wait for
 /// completion.  Returns the number of bytes transferred.
+fn cancel_and_drain_overlapped(file_handle: HANDLE, ov: &OVERLAPPED) -> Result<(), UsbError> {
+    // SAFETY: `file_handle` is the handle used to submit this OVERLAPPED I/O,
+    // and `ov` points to the exact OVERLAPPED structure for that request.
+    unsafe { CancelIoEx(file_handle, Some(ov)) }
+        .map_err(|_| UsbError::Io(std::io::Error::last_os_error()))?;
+
+    let mut ignored = 0u32;
+    // SAFETY: waiting with `bWait=true` blocks until the canceled operation has
+    // fully completed, ensuring the kernel no longer references `ov` or its
+    // associated data buffer before this function returns.
+    match unsafe { GetOverlappedResult(file_handle, ov, &mut ignored, true) } {
+        Ok(()) => Ok(()),
+        Err(e) if e.code() == ERROR_OPERATION_ABORTED.to_hresult() => Ok(()),
+        Err(e) => Err(UsbError::from(e)),
+    }
+}
+
+/// Issue a WinUSB pipe read using an OVERLAPPED structure and wait for
+/// completion.  Returns the number of bytes transferred.
 fn overlapped_read(
     file_handle: HANDLE,
     usb_handle: WINUSB_INTERFACE_HANDLE,
@@ -1127,6 +1177,7 @@ fn overlapped_read(
                 }
                 Ok(transferred as usize)
             } else {
+                cancel_and_drain_overlapped(file_handle, &ov)?;
                 Err(UsbError::Timeout)
             }
         }
@@ -1175,6 +1226,7 @@ fn overlapped_write(
                 }
                 Ok(transferred as usize)
             } else {
+                cancel_and_drain_overlapped(file_handle, &ov)?;
                 Err(UsbError::Timeout)
             }
         }

@@ -1,10 +1,10 @@
 [package]
-name = "usblibr"
+name = "rust-usb"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "usb_lib"
+name = "rust_usb"
 
 [features]
 # Isochronous transfer support via WinUsb_RegisterIsochBuffer et al.
@@ -27,6 +27,7 @@ windows = { version = "0.58", features = [
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_System_Threading",
     "Win32_System_SystemServices",
+    "Win32_System_LibraryLoader",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
