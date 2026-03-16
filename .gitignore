@@ -1,0 +1,13 @@
+# Rust build output
+/usb-lib/target/
+
+# Per-package lock file (omitted for library crates per convention)
+usb-lib/Cargo.lock
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
